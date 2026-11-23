@@ -24,119 +24,186 @@ This recipe is the Managed Lustre variant of the [Hyperdisk-based Qwen3-32B sing
 
 ## Prerequisites
 
-1. A GKE cluster with TPU v6e support, running GKE `1.33.2-gke.4780000` or later (for the Managed Lustre CSI driver add-on).
-2. At least one CPU node pool in the cluster (used by the one-time model download Job).
-3. `gcloud` CLI and `kubectl` installed and configured.
-4. A Hugging Face account and access token with read access to `Qwen/Qwen3-32B` (used only for the download Job).
-5. IAM roles: in addition to the GKE / TPU roles used by the Hyperdisk recipe, **Google Cloud Managed Lustre Admin** (`roles/lustre.admin`) to create the Lustre instance.
+1. A Google Cloud project with billing enabled and TPU v6e quota (or a reservation) in your chosen zone.
+2. `gcloud` CLI and `kubectl` installed, and `gcloud auth login` completed.
+3. IAM roles: Kubernetes Engine Admin, Compute Network Admin (for Private Services Access), Service Usage Admin, and **Google Cloud Managed Lustre Admin** (`roles/lustre.admin`).
+4. (Optional) A Hugging Face access token. `Qwen/Qwen3-32B` is public, so the token only helps with rate limits.
+
+The zone must support **both** TPU v6e and Managed Lustre. The values below use `us-east5-a`, which supports both.
 
 ---
 
 ## Step 1: Define Parameters
 
-Export the necessary environment variables for your Google Cloud project, GKE cluster and Lustre instance:
-
 ```shell
-export PROJECT_ID="<YOUR_PROJECT_ID>"
-export CLUSTER_NAME="<YOUR_CLUSTER_NAME>"
-export REGION="<YOUR_REGION>"
-export ZONE="<YOUR_ZONE>"
+# Project and network
+export PROJECT_ID="tpu-launchpad-playground"
+export NETWORK="default"
+export ZONE="us-east5-a"
+export REGION="${ZONE%-*}"            # us-east5
+
+# GKE
+export CLUSTER_NAME="qwen-demo-cluster"
 export NODEPOOL_NAME="qwen3-32b-v6e-pool"
 
-export LUSTRE_INSTANCE_NAME="<YOUR_LUSTRE_INSTANCE_NAME>"
-export LUSTRE_ZONE="${ZONE}"   # Keep Lustre in the same zone as the TPU nodes
+# Managed Lustre
+export LUSTRE_INSTANCE_NAME="qwen-demo"
+export LUSTRE_ZONE="${ZONE}"           # same zone as the TPU nodes
+export LUSTRE_FILE_SYSTEM="qwendemo"   # <= 8 characters, letters and numbers only
+export LUSTRE_CAPACITY_GIB="9000"      # smallest instance size
+export LUSTRE_THROUGHPUT="1000"        # MBps per TiB; 9,000 GiB is only allowed on the 1000 tier
+
+gcloud config set project ${PROJECT_ID}
 ```
 
 ---
 
-## Step 2: Prepare the Cluster and Managed Lustre
-
-### Enable the Managed Lustre CSI driver
-
-For GKE clusters running `1.33.2-gke.4780000` or later:
+## Step 2: Enable the Required APIs
 
 ```shell
-gcloud container clusters update ${CLUSTER_NAME} \
-    --location=${REGION} \
-    --project=${PROJECT_ID} \
-    --update-addons=LustreCsiDriver=ENABLED
+gcloud services enable \
+    compute.googleapis.com \
+    container.googleapis.com \
+    lustre.googleapis.com \
+    servicenetworking.googleapis.com \
+    --project=${PROJECT_ID}
 ```
 
-For clusters running an earlier version, or to use an existing Managed Lustre instance that was created with the `gke-support-enabled` flag, enable the legacy port instead:
+---
+
+## Step 3: Set Up Private Services Access on the VPC
+
+Managed Lustre is reached over [Private Services Access](https://docs.cloud.google.com/vpc/docs/private-services-access). The VPC needs a peering connection to `servicenetworking.googleapis.com` with an allocated range of at least `/20`.
+
+1. Check whether the network already has a Private Services Access connection:
 
 ```shell
-gcloud container clusters update ${CLUSTER_NAME} \
-    --location=${REGION} \
-    --project=${PROJECT_ID} \
-    --enable-legacy-lustre-port
+gcloud services vpc-peerings list \
+    --network=${NETWORK} \
+    --project=${PROJECT_ID}
 ```
 
-> [!NOTE]
-> A node upgrade may be required for existing clusters. See [Node upgrade required](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/lustre-csi-driver-existing-instance#node-upgrade-required).
+If a connection is listed, skip to [Step 4](#step-4-create-the-managed-lustre-instance).
 
-### Create the Managed Lustre instance
+2. Otherwise, allocate a `/20` range and create the connection:
 
-Create a Managed Lustre instance by following [Create an instance](https://docs.cloud.google.com/managed-lustre/docs/create-instance). Create it:
+```shell
+gcloud compute addresses create lustre-psa-range \
+    --global \
+    --purpose=VPC_PEERING \
+    --prefix-length=20 \
+    --network=${NETWORK} \
+    --project=${PROJECT_ID}
 
-- on the **same VPC network** as the GKE cluster, and
-- in the **same zone** as the TPU v6e node pool, to keep model-load latency low.
+gcloud services vpc-peerings connect \
+    --service=servicenetworking.googleapis.com \
+    --ranges=lustre-psa-range \
+    --network=${NETWORK} \
+    --project=${PROJECT_ID}
+```
 
-The weights for Qwen3-32B are ~65 GB and the compile caches add a few GB, so the smallest instance size and throughput tier allowed by Managed Lustre is enough for this recipe. Choose a higher throughput tier if you plan to scale to many replicas that start up at the same time.
+---
 
-Collect the instance details needed for the PersistentVolume:
+## Step 4: Create the Managed Lustre Instance
+
+```shell
+gcloud lustre instances create ${LUSTRE_INSTANCE_NAME} \
+    --project=${PROJECT_ID} \
+    --location=${LUSTRE_ZONE} \
+    --network=projects/${PROJECT_ID}/global/networks/${NETWORK} \
+    --filesystem=${LUSTRE_FILE_SYSTEM} \
+    --capacity-gib=${LUSTRE_CAPACITY_GIB} \
+    --per-unit-storage-throughput=${LUSTRE_THROUGHPUT} \
+    --async
+```
+
+`--async` returns immediately, so you can create the GKE cluster (Steps 5 and 6) while the instance is provisioning. Check its state with:
 
 ```shell
 gcloud lustre instances describe ${LUSTRE_INSTANCE_NAME} \
+    --location=${LUSTRE_ZONE} \
     --project=${PROJECT_ID} \
-    --location=${LUSTRE_ZONE}
+    --format="value(state)"
 ```
 
-The output looks similar to the following:
+Wait for `ACTIVE` before Step 8.
 
-```text
-capacityGib: '18000'
-filesystem: lfs
-gkeSupportEnabled: true
-mountPoint: 10.90.1.4@tcp:/lfs
-name: projects/my-project/locations/us-east5-b/instances/my-lustre
-network: projects/my-project/global/networks/default
-perUnitStorageThroughput: '125'
-state: ACTIVE
+> [!NOTE]
+> The performance tier can't be changed after creation. Capacity can be increased later.
+
+---
+
+## Step 5: Create the GKE Cluster
+
+Create a regional cluster with its nodes in `${ZONE}` and the **Managed Lustre CSI driver** add-on enabled. The default node pool is a small CPU pool that runs system pods and the one-time model download Job.
+
+```shell
+gcloud container clusters create ${CLUSTER_NAME} \
+    --project=${PROJECT_ID} \
+    --location=${REGION} \
+    --node-locations=${ZONE} \
+    --network=${NETWORK} \
+    --subnetwork=${NETWORK} \
+    --release-channel=regular \
+    --workload-pool=${PROJECT_ID}.svc.id.goog \
+    --machine-type=e2-standard-8 \
+    --num-nodes=1 \
+    --addons=LustreCsiDriver,GcePersistentDiskCsiDriver,HttpLoadBalancing
+```
+
+> [!NOTE]
+> The `LustreCsiDriver` add-on needs GKE `1.33.2-gke.4780000` or later. To add it to an **existing** cluster instead, run `gcloud container clusters update ${CLUSTER_NAME} --location=${REGION} --update-addons=LustreCsiDriver=ENABLED`. A node upgrade may be required; see [Node upgrade required](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/lustre-csi-driver-existing-instance#node-upgrade-required).
+
+Verify that the add-on is enabled (look for the Lustre CSI driver entry with `enabled: true`):
+
+```shell
+gcloud container clusters describe ${CLUSTER_NAME} \
+    --location=${REGION} \
+    --project=${PROJECT_ID} \
+    --format="yaml(addonsConfig)"
 ```
 
 ---
 
-## Step 3: Create the Single-Host TPU Node Pool and Kubernetes Resources
+## Step 6: Create the TPU v6e Node Pool
 
-1. Create a TPU v6e (Trillium) node pool with the `ct6e-standard-8t` machine type and `2x4` topology (1 host, 8 chips):
+Create a TPU v6e (Trillium) node pool with the `ct6e-standard-8t` machine type and `2x4` topology (1 host, 8 chips):
 
 ```shell
 gcloud container node-pools create ${NODEPOOL_NAME} \
     --project=${PROJECT_ID} \
+    --cluster=${CLUSTER_NAME} \
     --location=${REGION} \
     --node-locations=${ZONE} \
     --num-nodes=1 \
     --machine-type=ct6e-standard-8t \
-    --tpu-topology=2x4 \
-    --cluster=${CLUSTER_NAME}
+    --tpu-topology=2x4
 ```
 
 > [!TIP]
-> To serve multiple replicas, set `--num-nodes` to the number of replicas you plan to run (one `2x4` host per replica).
+> If you have a TPU reservation, add `--reservation-affinity=specific --reservation=<RESERVATION_NAME>`. To serve multiple replicas later, set `--num-nodes` to the number of replicas (one `2x4` host per replica).
 
-2. Configure `kubectl` to communicate with your cluster:
+---
+
+## Step 7: Configure kubectl, Namespace and Secret
+
+1. Fetch cluster credentials and check the nodes:
 
 ```shell
-gcloud container clusters get-credentials ${CLUSTER_NAME} --location=${REGION} --project=${PROJECT_ID}
+gcloud container clusters get-credentials ${CLUSTER_NAME} \
+    --location=${REGION} \
+    --project=${PROJECT_ID}
+
+kubectl get nodes -L cloud.google.com/gke-tpu-accelerator,cloud.google.com/gke-tpu-topology
 ```
 
-3. Create the namespace `vllm-qwen3-32b`:
+2. Create the namespace:
 
 ```shell
 kubectl create namespace vllm-qwen3-32b
 ```
 
-4. Create a Kubernetes secret for your Hugging Face token (used only by the download Job):
+3. (Optional) Create the Hugging Face token secret used by the download Job:
 
 ```shell
 export HF_TOKEN="YOUR_HUGGING_FACE_API_TOKEN"
@@ -145,32 +212,55 @@ kubectl create secret generic hf-secret \
     --from-literal=hf_api_token=${HF_TOKEN}
 ```
 
-5. Create the Lustre PersistentVolume and PersistentVolumeClaim. Edit [lustre_pvc.yaml](./lustre_pvc.yaml) and replace the `<...>` placeholders with the values from `gcloud lustre instances describe`:
+---
 
-| Placeholder | Source | Example |
-| :---- | :---- | :---- |
-| `<LUSTRE_CAPACITY>` | `capacityGib`, with a `Gi` suffix | `18000Gi` |
-| `<LUSTRE_PROJECT_ID>` | Project that owns the instance | `my-project` |
-| `<LUSTRE_ZONE>` | Zone of the instance | `us-east5-b` |
-| `<LUSTRE_INSTANCE_NAME>` | Instance name | `my-lustre` |
-| `<LUSTRE_IP_ADDRESS>` | IP part of `mountPoint` | `10.90.1.4` |
-| `<LUSTRE_FILE_SYSTEM>` | `filesystem` | `lfs` |
+## Step 8: Connect Lustre to the Cluster (PV/PVC)
 
-Then apply it and confirm the claim is `Bound`:
+1. Once the Lustre instance is `ACTIVE`, read its details:
+
+```shell
+gcloud lustre instances describe ${LUSTRE_INSTANCE_NAME} \
+    --location=${LUSTRE_ZONE} \
+    --project=${PROJECT_ID}
+```
+
+The output looks similar to the following:
+
+```text
+capacityGib: '9000'
+filesystem: qwendemo
+mountPoint: 10.90.1.4@tcp:/qwendemo
+name: projects/tpu-launchpad-playground/locations/us-east5-a/instances/qwen-demo
+network: projects/tpu-launchpad-playground/global/networks/default
+perUnitStorageThroughput: '1000'
+state: ACTIVE
+```
+
+2. Edit [lustre_pvc.yaml](./lustre_pvc.yaml) and replace the placeholders:
+
+| Placeholder | Value |
+| :---- | :---- |
+| `<LUSTRE_CAPACITY>` | `9000Gi` |
+| `<LUSTRE_PROJECT_ID>` | `tpu-launchpad-playground` |
+| `<LUSTRE_ZONE>` | `us-east5-a` |
+| `<LUSTRE_INSTANCE_NAME>` | `qwen-demo` |
+| `<LUSTRE_IP_ADDRESS>` | IP part of `mountPoint`, e.g. `10.90.1.4` |
+| `<LUSTRE_FILE_SYSTEM>` | `qwendemo` |
+
+3. Apply it and confirm the claim is `Bound`:
 
 ```shell
 cd tpu-recipes/inference/trillium/vLLM/vLLM-TorchTPU/Qwen3-32B/single-host-lustre
 kubectl apply -f lustre_pvc.yaml
+kubectl get pv lustre-qwen3-pv
 kubectl get pvc -n vllm-qwen3-32b lustre-qwen3-pvc
 ```
 
-Creating the Lustre instance and its PV/PVC is a one-time setup.
-
 ---
 
-## Step 4: Download the Model to Lustre
+## Step 9: Download the Model to Lustre
 
-Run the one-time download Job in [model-download-job.yaml](./model-download-job.yaml). It runs on a CPU node and writes the weights to `/models/Qwen/Qwen3-32B` on the Lustre file system:
+Run the one-time download Job in [model-download-job.yaml](./model-download-job.yaml). It runs on the CPU node pool and writes the weights to `/models/Qwen/Qwen3-32B` on the Lustre file system:
 
 ```shell
 kubectl apply -f model-download-job.yaml
@@ -198,7 +288,7 @@ Layout of the Lustre file system used by this recipe:
 
 ---
 
-## Step 5: Apply the vLLM Server Manifest
+## Step 10: Deploy the vLLM Server
 
 Apply the vLLM server manifest using [qwen3-32b-server.yaml](./qwen3-32b-server.yaml):
 
@@ -206,15 +296,10 @@ Apply the vLLM server manifest using [qwen3-32b-server.yaml](./qwen3-32b-server.
 kubectl apply -f qwen3-32b-server.yaml
 ```
 
-Monitor the progress of the server deployment:
+Monitor the deployment and follow the logs during model loading and XLA compilation:
 
 ```shell
 kubectl get pods -n vllm-qwen3-32b -w
-```
-
-Follow the server logs during model loading and XLA compilation:
-
-```shell
 kubectl logs -n vllm-qwen3-32b deployment/vllm-qwen3-32b -c vllm-torchtpu -f
 ```
 
@@ -230,22 +315,7 @@ The first start compiles and writes the XLA / torch.compile caches to Lustre. La
 
 ---
 
-## Step 6: Scale Out (Optional)
-
-Because the Lustre volume is `ReadWriteMany`, additional replicas can share the same weights and caches. After the first replica is `Ready` (so the compile cache is fully populated), scale the Deployment:
-
-```shell
-kubectl scale deployment/vllm-qwen3-32b -n vllm-qwen3-32b --replicas=4
-```
-
-Each replica needs its own `2x4` v6e host; make sure the node pool has enough nodes. The `vllm-qwen3-32b-service` Service load-balances requests across all ready replicas.
-
-> [!IMPORTANT]
-> Scale only after the first replica has finished compiling. Starting many replicas against an empty cache makes each of them compile in parallel and write to the same cache directory.
-
----
-
-## Step 7: Interact with the Model (Optional)
+## Step 11: Interact with the Model
 
 1. Port-forward the vLLM service to port `8000` on your local machine:
 
@@ -253,7 +323,7 @@ Each replica needs its own `2x4` v6e host; make sure the node pool has enough no
 kubectl port-forward -n vllm-qwen3-32b service/vllm-qwen3-32b-service 8000:8000
 ```
 
-2. Send a test chat completion request. The server registers the model under `--served-model-name=Qwen/Qwen3-32B`, so clients use the same model name as in the Hyperdisk recipe:
+2. Send a test chat completion request. The server registers the model under `--served-model-name=Qwen/Qwen3-32B`:
 
 ```shell
 curl http://localhost:8000/v1/chat/completions \
@@ -270,7 +340,46 @@ curl http://localhost:8000/v1/chat/completions \
 
 ---
 
-## Step 8: Run Serving Benchmarks
+## Step 12: Show the Warm Start (Demo)
+
+Restart the Deployment. The new pod loads the weights from Lustre and reuses the compile cache that the first pod wrote:
+
+```shell
+kubectl rollout restart deployment/vllm-qwen3-32b -n vllm-qwen3-32b
+kubectl get pods -n vllm-qwen3-32b -w
+```
+
+Compare cold and warm start times (pod creation to `Ready`):
+
+```shell
+kubectl get pod -n vllm-qwen3-32b -l app=vllm-qwen3-32b \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"  created="}{.metadata.creationTimestamp}{"  ready="}{.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}{end}'
+```
+
+---
+
+## Step 13: Scale Out (Optional)
+
+Because the Lustre volume is `ReadWriteMany`, more replicas can share the same weights and caches. Add TPU nodes first (one `2x4` host per replica), then scale the Deployment:
+
+```shell
+gcloud container clusters resize ${CLUSTER_NAME} \
+    --node-pool=${NODEPOOL_NAME} \
+    --num-nodes=2 \
+    --location=${REGION} \
+    --project=${PROJECT_ID}
+
+kubectl scale deployment/vllm-qwen3-32b -n vllm-qwen3-32b --replicas=2
+```
+
+The `vllm-qwen3-32b-service` Service load-balances requests across all ready replicas.
+
+> [!IMPORTANT]
+> Scale only after the first replica has finished compiling. Starting many replicas against an empty cache makes each of them compile in parallel and write to the same cache directory.
+
+---
+
+## Step 14: Run Serving Benchmarks (Optional)
 
 The namespace, Service name and served model name are the same as in the Hyperdisk recipe, so the three benchmark manifests from [Step 6 of that recipe](../single-host/README.md#step-6-run-serving-benchmarks) (`1k/1k`, `1k/8k`, `8k/1k`) work against this deployment unchanged. For example, for `1k/1k`, save the following manifest as `qwen3-32b-benchmark-1k1k.yaml`:
 
@@ -331,45 +440,45 @@ kubectl logs -n vllm-qwen3-32b qwen3-32b-bench-1k1k -f
 kubectl delete -f qwen3-32b-benchmark-1k1k.yaml
 ```
 
-Serving throughput and latency should match the Hyperdisk recipe, because weights are in HBM once loaded. The difference shows up in **startup time**: measure it with
-
-```shell
-kubectl get pod -n vllm-qwen3-32b -l app=vllm-qwen3-32b \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"  created="}{.metadata.creationTimestamp}{"  ready="}{.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}{end}'
-```
-
-and compare a cold start (first pod, empty cache) with a warm start (`kubectl rollout restart deployment/vllm-qwen3-32b -n vllm-qwen3-32b`).
+Serving throughput and latency should match the Hyperdisk recipe, because the weights are in HBM once loaded. The Lustre benefit shows up in startup time (Step 12) and in scale-out (Step 13).
 
 ---
 
-## Step 9: Cleanup
+## Step 15: Cleanup
 
-1. Delete the vLLM server and the download Job:
+1. Delete the Kubernetes resources:
 
 ```shell
 kubectl delete -f qwen3-32b-server.yaml
 kubectl delete -f model-download-job.yaml --ignore-not-found
-```
-
-2. Delete the Lustre PV/PVC. The PV uses `persistentVolumeReclaimPolicy: Retain`, so the data on the Lustre instance is kept:
-
-```shell
 kubectl delete -f lustre_pvc.yaml
 ```
 
-3. (Optional) Delete the Managed Lustre instance. **This permanently deletes the weights and caches stored on it:**
+The PV uses `persistentVolumeReclaimPolicy: Retain`, so the data on the Lustre instance is kept until you delete the instance.
+
+2. Delete the GKE cluster (this also deletes the TPU node pool):
+
+```shell
+gcloud container clusters delete ${CLUSTER_NAME} \
+    --location=${REGION} \
+    --project=${PROJECT_ID}
+```
+
+3. Delete the Managed Lustre instance. **This permanently deletes the weights and caches stored on it:**
 
 ```shell
 gcloud lustre instances delete ${LUSTRE_INSTANCE_NAME} \
-    --project=${PROJECT_ID} \
-    --location=${LUSTRE_ZONE}
+    --location=${LUSTRE_ZONE} \
+    --project=${PROJECT_ID}
 ```
 
-4. (Optional) Delete the GKE TPU node pool:
+4. (Optional) Remove the Private Services Access connection and range created in Step 3, **only if nothing else in the VPC uses them** (for example Cloud SQL, Memorystore or Filestore):
 
 ```shell
-gcloud container node-pools delete ${NODEPOOL_NAME} \
-    --cluster=${CLUSTER_NAME} \
-    --location=${REGION} \
+gcloud services vpc-peerings delete \
+    --service=servicenetworking.googleapis.com \
+    --network=${NETWORK} \
     --project=${PROJECT_ID}
+
+gcloud compute addresses delete lustre-psa-range --global --project=${PROJECT_ID}
 ```
