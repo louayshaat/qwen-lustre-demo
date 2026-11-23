@@ -1,0 +1,172 @@
+# vLLM (TorchTPU) server for Qwen3-32B on Trillium (v6e 2x4, TP=8).
+#
+# Differences from the Hyperdisk version of this recipe:
+#   * Weights are read from Managed Lustre (lustre-qwen3-pvc, created by
+#     lustre_pvc.yaml) instead of being downloaded from Hugging Face into a
+#     per-pod Hyperdisk Balanced PVC.
+#   * The XLA and torch.compile caches live on Lustre, so they are shared by
+#     all replicas and survive pod restarts / rescheduling.
+#   * The volume is ReadWriteMany, so `replicas` can be scaled beyond 1.
+#   * HF_HUB_OFFLINE=1: the server never contacts Hugging Face at runtime.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-qwen3-32b
+  namespace: vllm-qwen3-32b
+spec:
+  # Start with 1 replica so the first pod populates the shared compile caches,
+  # then scale up (see README, Step 6).
+  replicas: 1
+  # TPU node pools are fixed-size: a RollingUpdate needs a spare 8-chip node to
+  # surge onto, so use Recreate to avoid rollout deadlocks.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-qwen3-32b
+  template:
+    metadata:
+      labels:
+        app: vllm-qwen3-32b
+    spec:
+      terminationGracePeriodSeconds: 75
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "2x4"
+      tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: vllm-torchtpu
+          image: vllm/vllm-torchtpu:v0.29.0
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              if [ ! -f "${MODEL_DIR}/config.json" ]; then
+                echo "ERROR: ${MODEL_DIR}/config.json not found on the Lustre volume." >&2
+                echo "Run model-download-job.yaml first (README, Step 4)." >&2
+                exit 1
+              fi
+              mkdir -p "${HF_HOME}" "${TMPDIR}" "${VLLM_TORCH_COMPILE_CACHE_DIR}" "${VLLM_XLA_CACHE_PATH}"
+              exec vllm serve "${MODEL_DIR}" \
+                --served-model-name=Qwen/Qwen3-32B \
+                --tokenizer="${MODEL_DIR}" \
+                --host=0.0.0.0 \
+                --port=8000 \
+                --tensor-parallel-size=8 \
+                --attention-backend=CUSTOM \
+                --kv-cache-dtype=fp8 \
+                --gpu-memory-utilization=0.90 \
+                --block-size=256 \
+                --max-model-len=16384 \
+                --max-num-seqs=64 \
+                --max-num-batched-tokens=8192 \
+                --async-scheduling \
+                --enable-prefix-caching \
+                --enable-auto-tool-choice \
+                --tool-call-parser=hermes \
+                --reasoning-parser=qwen3 \
+                --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+                --shutdown-timeout=45
+          env:
+            # Model weights on Lustre (written by model-download-job.yaml).
+            - name: MODEL_DIR
+              value: "/data/models/Qwen/Qwen3-32B"
+            # Compile caches on Lustre, keyed by model + topology + TP so that
+            # different configurations never share a cache directory.
+            - name: VLLM_XLA_CACHE_PATH
+              value: "/data/cache/qwen3-32b-v6e-2x4-tp8/xla_cache"
+            - name: VLLM_TORCH_COMPILE_CACHE_DIR
+              value: "/data/cache/qwen3-32b-v6e-2x4-tp8/torch_compile_cache"
+            # Per-pod scratch stays on local (emptyDir) storage.
+            - name: HF_HOME
+              value: "/scratch/hf_home"
+            - name: TMPDIR
+              value: "/scratch/tmp"
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: VLLM_PLUGINS
+              value: "torchtpu"
+            - name: VLLM_TARGET_DEVICE
+              value: "tpu"
+            - name: PJRT_DEVICE
+              value: "TPU"
+            - name: TPU_PROCESS_ADDRESSES
+              value: ""
+            - name: TPU_EVICT_WEIGHTS_PAGE_CACHE
+              value: "1"
+            - name: TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS
+              value: "false"
+            - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+              value: "0"
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: "3600"
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          resources:
+            limits:
+              cpu: "64"
+              memory: 256Gi
+              google.com/tpu: "8"
+            requests:
+              cpu: "64"
+              memory: 256Gi
+              google.com/tpu: "8"
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 120
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: lustre
+              mountPath: /data
+            - name: scratch
+              mountPath: /scratch
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: lustre
+          persistentVolumeClaim:
+            claimName: lustre-qwen3-pvc
+        - name: scratch
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-qwen3-32b-service
+  namespace: vllm-qwen3-32b
+spec:
+  selector:
+    app: vllm-qwen3-32b
+  type: ClusterIP
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8000
+      targetPort: 8000

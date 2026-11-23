@@ -1,0 +1,51 @@
+# Static PersistentVolume / PersistentVolumeClaim for an existing
+# Google Cloud Managed Lustre instance.
+#
+# Replace every <...> placeholder with the values returned by:
+#   gcloud lustre instances describe <LUSTRE_INSTANCE_NAME> \
+#       --project=<LUSTRE_PROJECT_ID> --location=<LUSTRE_ZONE>
+#
+#   <LUSTRE_CAPACITY>       capacityGib from the describe output, e.g. 18000Gi
+#   <LUSTRE_PROJECT_ID>     project that owns the Lustre instance
+#   <LUSTRE_ZONE>           zone of the Lustre instance, e.g. us-east5-b
+#   <LUSTRE_INSTANCE_NAME>  name of the Lustre instance
+#   <LUSTRE_IP_ADDRESS>     IP part of mountPoint, e.g. 10.90.1.4 from 10.90.1.4@tcp:/lfs
+#   <LUSTRE_FILE_SYSTEM>    filesystem from the describe output, e.g. lfs
+#
+# Creating the PV/PVC is a one-time setup. The volume is ReadWriteMany, so the
+# model download Job and every vLLM replica share the same weights and caches.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: lustre-qwen3-pv
+spec:
+  storageClassName: ""
+  capacity:
+    storage: <LUSTRE_CAPACITY>
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem
+  claimRef:
+    namespace: vllm-qwen3-32b
+    name: lustre-qwen3-pvc
+  csi:
+    driver: lustre.csi.storage.gke.io
+    volumeHandle: <LUSTRE_PROJECT_ID>/<LUSTRE_ZONE>/<LUSTRE_INSTANCE_NAME>
+    volumeAttributes:
+      ip: <LUSTRE_IP_ADDRESS>
+      filesystem: <LUSTRE_FILE_SYSTEM>
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lustre-qwen3-pvc
+  namespace: vllm-qwen3-32b
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: lustre-qwen3-pv
+  resources:
+    requests:
+      storage: <LUSTRE_CAPACITY>

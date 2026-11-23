@@ -1,0 +1,54 @@
+# One-time Job that downloads Qwen/Qwen3-32B from Hugging Face directly into
+# the Managed Lustre volume. It runs on a CPU node (TPU nodes are tainted), so
+# no TPU capacity is consumed while the ~65 GB of BF16 weights are fetched.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-32b-download
+  namespace: vllm-qwen3-32b
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: hf-download
+          image: python:3.12-slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir --quiet "huggingface_hub[hf_xet]"
+              mkdir -p "${MODEL_DIR}"
+              hf download Qwen/Qwen3-32B \
+                --local-dir "${MODEL_DIR}" \
+                --max-workers 16
+              echo "Download complete:"
+              du -sh "${MODEL_DIR}"
+              ls -lh "${MODEL_DIR}"
+          env:
+            - name: MODEL_DIR
+              value: "/data/models/Qwen/Qwen3-32B"
+            - name: HF_HOME
+              value: "/tmp/hf_home"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: hf_api_token
+                  optional: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          volumeMounts:
+            - name: lustre
+              mountPath: /data
+      volumes:
+        - name: lustre
+          persistentVolumeClaim:
+            claimName: lustre-qwen3-pvc
